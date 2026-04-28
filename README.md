@@ -82,7 +82,7 @@ The tool automatically uses these ffuf flags:
 
 ## Output Format
 
-```
+```console
 [DEPTH-1] https://sagadb.org/images [Status: 301, Size: 274, Words: 15, Lines: 8, Duration: 158ms]
 [DEPTH-1] https://sagadb.org/downloads [Status: 200, Size: 4060, Words: 602, Lines: 95, Duration: 160ms]
 [DEPTH-1] https://sagadb.org/.htaccess [Status: 403, Size: 239, Words: 15, Lines: 8, Duration: 153ms]
