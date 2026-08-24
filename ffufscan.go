@@ -12,13 +12,13 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/spf13/pflag"
 	"github.com/rix4uni/ffufscan/banner"
+	"github.com/spf13/pflag"
 )
 
 // DuplicateTracker tracks unique fingerprints per domain
 type DuplicateTracker struct {
-	mu         sync.RWMutex
+	mu           sync.RWMutex
 	fingerprints map[string]map[string]bool // domain -> fingerprint -> seen
 }
 
@@ -51,24 +51,25 @@ func (dt *DuplicateTracker) MarkSeen(domain, fingerprint string) {
 
 // FfufResult represents a single ffuf JSON output line
 type FfufResult struct {
-	URL      string  `json:"url"`
-	Status   int     `json:"status"`
-	Length   int     `json:"length"`
-	Words    int     `json:"words"`
-	Lines    int     `json:"lines"`
-	Duration int64   `json:"duration"`
+	URL      string `json:"url"`
+	Status   int    `json:"status"`
+	Length   int    `json:"length"`
+	Words    int    `json:"words"`
+	Lines    int    `json:"lines"`
+	Duration int64  `json:"duration"`
 }
 
 func main() {
 	wordlist := pflag.String("wordlist", "", "Path to wordlist (required)")
-	ffufArgs := pflag.String("ffuf-args", "", "Additional ffuf flags (e.g., '-mc 200,301 -t 100')")
-	filterDups := pflag.Bool("filter", false, "Filter duplicate responses (same Size, Words, Lines per domain)")
-	recursive := pflag.Bool("recursive", false, "Enable recursive directory enumeration")
-	recursionDepth := pflag.Int("recursion-depth", 0, "Maximum recursion depth (0 = no recursion)")
+	ffufcmd := pflag.String("ffufcmd", "", "Additional ffuf flags (e.g., '-mc 200,301 -t 100')")
+	noFilter := pflag.Bool("no-filter", false, "Disable duplicate responses filter (same Size, Words, Lines per domain)")
+	depth := pflag.Int("depth", 0, "Maximum directory recursion depth (0 = no recursion)")
 	fuzzCode := pflag.String("fuzzcode", "", "Status codes to trigger recursion (e.g., '301,302')")
 	silent := pflag.Bool("silent", false, "Silent mode.")
 	version := pflag.Bool("version", false, "Print the version of the tool and exit.")
 	pflag.Parse()
+
+	filterDups := !*noFilter
 
 	if *version {
 		banner.PrintBanner()
@@ -79,8 +80,6 @@ func main() {
 	if !*silent {
 		banner.PrintBanner()
 	}
-
-	tracker := NewDuplicateTracker()
 
 	// Parse fuzzcode if provided
 	var targetCodes map[int]bool
@@ -104,9 +103,9 @@ func main() {
 	var urls []string
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
-		url := strings.TrimSpace(scanner.Text())
-		if url != "" {
-			urls = append(urls, url)
+		u := strings.TrimSpace(scanner.Text())
+		if u != "" {
+			urls = append(urls, u)
 		}
 	}
 
@@ -122,38 +121,110 @@ func main() {
 
 	// Parse additional ffuf args
 	var extraArgs []string
-	if *ffufArgs != "" {
-		extraArgs = parseArgs(*ffufArgs)
+	if *ffufcmd != "" {
+		extraArgs = parseArgs(*ffufcmd)
 	}
 
-	// Worker pool with 5 concurrent workers
-	const numWorkers = 5
-	urlChan := make(chan string, len(urls))
-	var wg sync.WaitGroup
+	// Determine max depth
+	maxDepth := 1
+	if *depth > 0 {
+		maxDepth = *depth
+	}
 
-	// Start workers
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for targetURL := range urlChan {
-				runFfuf(targetURL, *wordlist, extraArgs, *filterDups, tracker, 1)
+	// Track scanned directories per domain to avoid duplicate scans
+	scannedDirs := make(map[string]map[string]bool)
+	for _, u := range urls {
+		parsed, err := url.Parse(u)
+		if err == nil {
+			if scannedDirs[parsed.Host] == nil {
+				scannedDirs[parsed.Host] = make(map[string]bool)
 			}
-		}()
+			scannedDirs[parsed.Host][strings.TrimRight(u, "/")] = true
+			scannedDirs[parsed.Host][strings.TrimRight(u, "/")+"/"] = true
+		}
 	}
 
-	// Send URLs to workers
-	for _, url := range urls {
-		urlChan <- url
-	}
-	close(urlChan)
+	const numWorkers = 5
+	currentURLs := urls
 
-	// Wait for all workers to finish
-	wg.Wait()
+	for currentDepth := 1; currentDepth <= maxDepth; currentDepth++ {
+		var (
+			depthTracker *DuplicateTracker
+			mu           sync.Mutex
+			results      []FfufResult
+			wg           sync.WaitGroup
+		)
 
-	// Handle recursion if enabled
-	if *recursive && *recursionDepth > 0 {
-		runRecursiveScans(urls, *wordlist, extraArgs, *recursionDepth, targetCodes, tracker, 2, *filterDups)
+		if filterDups {
+			depthTracker = NewDuplicateTracker()
+		}
+
+		numW := numWorkers
+		if len(currentURLs) < numW {
+			numW = len(currentURLs)
+		}
+
+		urlChan := make(chan string, len(currentURLs))
+
+		for i := 0; i < numW; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for targetURL := range urlChan {
+					r := runFfuf(targetURL, *wordlist, extraArgs, depthTracker, filterDups, currentDepth)
+					if currentDepth < maxDepth {
+						mu.Lock()
+						results = append(results, r...)
+						mu.Unlock()
+					}
+				}
+			}()
+		}
+
+		for _, u := range currentURLs {
+			urlChan <- u
+		}
+		close(urlChan)
+		wg.Wait()
+
+		if currentDepth >= maxDepth {
+			break
+		}
+
+		// Find discovered directories for the next depth level
+		var nextURLs []string
+		for _, res := range results {
+			if targetCodes != nil && !targetCodes[res.Status] {
+				continue
+			}
+
+			if isDirectory(res.URL) {
+				parsed, err := url.Parse(res.URL)
+				if err != nil {
+					continue
+				}
+				domain := parsed.Host
+
+				if scannedDirs[domain] == nil {
+					scannedDirs[domain] = make(map[string]bool)
+				}
+
+				trimmedURL := strings.TrimRight(res.URL, "/")
+				if scannedDirs[domain][trimmedURL] || scannedDirs[domain][trimmedURL+"/"] {
+					continue
+				}
+				scannedDirs[domain][trimmedURL] = true
+				scannedDirs[domain][trimmedURL+"/"] = true
+
+				nextURLs = append(nextURLs, res.URL)
+			}
+		}
+
+		if len(nextURLs) == 0 {
+			break
+		}
+
+		currentURLs = nextURLs
 	}
 }
 
@@ -207,101 +278,17 @@ func parseStatusCodes(codes string) map[int]bool {
 	return result
 }
 
-func runRecursiveScans(initialURLs []string, wordlist string, extraArgs []string, maxDepth int, targetCodes map[int]bool, tracker *DuplicateTracker, startDepth int, filterDups bool) {
-	// Track all discovered directories per domain to avoid re-scanning
-	scannedDirs := make(map[string]map[string]bool) // domain -> directory URL -> scanned
-
-	// Build initial set of base URLs
-	currentURLs := make([]string, len(initialURLs))
-	copy(currentURLs, initialURLs)
-
-	for depth := 0; depth < maxDepth; depth++ {
-		currentDepth := startDepth + depth
-		var nextURLs []string
-
-		// Create a new tracker for this depth level to enable per-depth deduplication
-		depthTracker := NewDuplicateTracker()
-
-		// Collect results for this depth level
-		var mu sync.Mutex
-		var results []FfufResult
-
-		// Run ffuf on current URLs
-		const numWorkers = 5
-		urlChan := make(chan string, len(currentURLs))
-		var wg sync.WaitGroup
-
-		for i := 0; i < numWorkers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for targetURL := range urlChan {
-					r := runFfufCollect(targetURL, wordlist, extraArgs, depthTracker, currentDepth, filterDups)
-					mu.Lock()
-					results = append(results, r...)
-					mu.Unlock()
-				}
-			}()
-		}
-
-		for _, u := range currentURLs {
-			urlChan <- u
-		}
-		close(urlChan)
-		wg.Wait()
-
-		// Print results and find directories for next level
-		for _, res := range results {
-			// Print the result with colors and depth prefix if verbose
-			printResult(res, currentDepth)
-
-			// Check if this should trigger recursion
-			if targetCodes != nil && !targetCodes[res.Status] {
-				continue
-			}
-
-			// Check if it's a directory (no dot in last segment)
-			if isDirectory(res.URL) {
-				parsed, err := url.Parse(res.URL)
-				if err != nil {
-					continue
-				}
-				domain := parsed.Host
-
-				// Initialize map for this domain if needed
-				if scannedDirs[domain] == nil {
-					scannedDirs[domain] = make(map[string]bool)
-				}
-
-				// Skip if already scanned
-				if scannedDirs[domain][res.URL] {
-					continue
-				}
-				scannedDirs[domain][res.URL] = true
-
-				// Add to next level URLs
-				nextURLs = append(nextURLs, res.URL)
-			}
-		}
-
-		// If no new directories found, stop
-		if len(nextURLs) == 0 {
-			break
-		}
-
-		currentURLs = nextURLs
-	}
-}
-
 func isDirectory(urlStr string) bool {
 	parsed, err := url.Parse(urlStr)
 	if err != nil {
 		return false
 	}
-	// Get the last path segment
-	lastSegment := path.Base(parsed.Path)
-	// A directory has no dot in its name
-	return !strings.Contains(lastSegment, ".")
+	cleanPath := path.Clean(parsed.Path)
+	if cleanPath == "/" || cleanPath == "." {
+		return false
+	}
+	lastSegment := path.Base(cleanPath)
+	return lastSegment != "" && lastSegment != "/" && lastSegment != "." && !strings.Contains(lastSegment, ".")
 }
 
 func printResult(result FfufResult, depth int) {
@@ -338,79 +325,7 @@ func printResult(result FfufResult, depth int) {
 		reset)
 }
 
-func runFfufCollect(targetURL, wordlist string, extraArgs []string, tracker *DuplicateTracker, depth int, filterDups bool) []FfufResult {
-	var results []FfufResult
-
-	// Extract domain for filtering
-	var domain string
-	parsedURL, err := url.Parse(targetURL)
-	if err == nil {
-		domain = parsedURL.Host
-	}
-
-	// Ensure URL ends with FUZZ
-	fuzzURL := targetURL
-	if !strings.HasSuffix(fuzzURL, "FUZZ") {
-		if !strings.HasSuffix(fuzzURL, "/") {
-			fuzzURL += "/"
-		}
-		fuzzURL += "FUZZ"
-	}
-
-	// Build base ffuf command
-	args := []string{
-		"-s",
-		"-u", fuzzURL,
-		"-w", wordlist,
-		"-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-		"-maxtime-job", "60",
-		"-json",
-	}
-
-	// Add extra args
-	args = append(args, extraArgs...)
-
-	cmd := exec.Command("ffuf", args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return results
-	}
-
-	if err := cmd.Start(); err != nil {
-		return results
-	}
-
-	// Parse JSON output line by line
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-
-		var result FfufResult
-		if err := json.Unmarshal([]byte(line), &result); err != nil {
-			continue
-		}
-
-		// Check for duplicates if filtering is enabled
-		if filterDups && domain != "" {
-			fingerprint := fmt.Sprintf("%d:%d:%d", result.Length, result.Words, result.Lines)
-			if tracker.IsDuplicate(domain, fingerprint) {
-				continue
-			}
-			tracker.MarkSeen(domain, fingerprint)
-		}
-
-		results = append(results, result)
-		printResult(result, depth)
-	}
-
-	cmd.Wait()
-	return results
-}
-
-func runFfuf(targetURL, wordlist string, extraArgs []string, filterDups bool, tracker *DuplicateTracker, depth int) []FfufResult {
+func runFfuf(targetURL, wordlist string, extraArgs []string, tracker *DuplicateTracker, filterDups bool, depth int) []FfufResult {
 	var results []FfufResult
 
 	// Extract domain for filtering
@@ -421,6 +336,7 @@ func runFfuf(targetURL, wordlist string, extraArgs []string, filterDups bool, tr
 			domain = parsedURL.Host
 		}
 	}
+
 	// Ensure URL ends with FUZZ
 	fuzzURL := targetURL
 	if !strings.HasSuffix(fuzzURL, "FUZZ") {
@@ -468,7 +384,7 @@ func runFfuf(targetURL, wordlist string, extraArgs []string, filterDups bool, tr
 		}
 
 		// Check for duplicates if filtering is enabled
-		if filterDups && domain != "" {
+		if filterDups && tracker != nil && domain != "" {
 			fingerprint := fmt.Sprintf("%d:%d:%d", result.Length, result.Words, result.Lines)
 			if tracker.IsDuplicate(domain, fingerprint) {
 				continue
