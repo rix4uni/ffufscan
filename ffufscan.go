@@ -325,6 +325,17 @@ func printResult(result FfufResult, depth int) {
 		reset)
 }
 
+func prepareURL(targetURL string) string {
+	fuzzURL := targetURL
+	if !strings.Contains(fuzzURL, "FUZZ") {
+		if !strings.HasSuffix(fuzzURL, "/") {
+			fuzzURL += "/"
+		}
+		fuzzURL += "FUZZ"
+	}
+	return fuzzURL
+}
+
 func runFfuf(targetURL, wordlist string, extraArgs []string, tracker *DuplicateTracker, filterDups bool, depth int) []FfufResult {
 	var results []FfufResult
 
@@ -337,14 +348,8 @@ func runFfuf(targetURL, wordlist string, extraArgs []string, tracker *DuplicateT
 		}
 	}
 
-	// Ensure URL ends with FUZZ
-	fuzzURL := targetURL
-	if !strings.HasSuffix(fuzzURL, "FUZZ") {
-		if !strings.HasSuffix(fuzzURL, "/") {
-			fuzzURL += "/"
-		}
-		fuzzURL += "FUZZ"
-	}
+	// Prepare URL: if targetURL contains FUZZ, use it directly; otherwise append /FUZZ
+	fuzzURL := prepareURL(targetURL)
 
 	// Build base ffuf command
 	args := []string{

@@ -14,9 +14,9 @@ go install github.com/rix4uni/ffufscan@latest
 
 ## Download prebuilt binaries
 ```
-wget https://github.com/rix4uni/ffufscan/releases/download/v0.0.2/ffufscan-linux-amd64-0.0.2.tgz
-tar -xvzf ffufscan-linux-amd64-0.0.2.tgz
-rm -rf ffufscan-linux-amd64-0.0.2.tgz
+wget https://github.com/rix4uni/ffufscan/releases/download/v0.0.3/ffufscan-linux-amd64-0.0.3.tgz
+tar -xvzf ffufscan-linux-amd64-0.0.3.tgz
+rm -rf ffufscan-linux-amd64-0.0.3.tgz
 mv ffufscan ~/go/bin/ffufscan
 ```
 Or download [binary release](https://github.com/rix4uni/ffufscan/releases) for your platform.
@@ -40,9 +40,25 @@ Usage of ffufscan:
 ```
 
 ## Usage Examples
-### Single URL
+### Default (Automatic Path Fuzzing)
+When no `FUZZ` keyword is present, `/FUZZ` is appended automatically:
 ```console
-echo "https://example.com" | ffufscan --wordlist wordlist.txt
+echo "https://example.com" | ffufscan --wordlist rix4uni-fav.txt
+```
+
+### Path Fuzzing
+```console
+echo "https://example.com/FUZZ" | ffufscan --wordlist rix4uni-fav.txt
+```
+
+### Subdomain Fuzzing
+```console
+echo "https://FUZZ.target.com" | ffufscan --wordlist 1m-subdomains.txt
+```
+
+### Parameter Fuzzing
+```console
+echo "https://target.com/index.php?FUZZ=rix4uni" | ffufscan --wordlist parameters.txt
 ```
 
 ### Multiple URLs
